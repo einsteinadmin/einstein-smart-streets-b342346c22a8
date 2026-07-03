@@ -171,7 +171,7 @@
           <div class="habit"><div class="ic">🚦</div><div><b>Light pacing — try to never stop</b>
             <span>"When a light is green, prepare to slow. When a light is red, prepare to go." Time it so you're still rolling.</span></div></div>
         </div>
-        <div class="keys" id="keyHelp"><kbd>↑</kbd> gas &nbsp;·&nbsp; <kbd>↓</kbd> brake &nbsp;·&nbsp; <kbd>←</kbd><kbd>→</kbd> change lanes &nbsp;·&nbsp; <kbd>P</kbd> pause</div>
+        <div class="keys" id="keyHelp"><kbd>↑</kbd> gas &nbsp;·&nbsp; <kbd>↓</kbd> brake &nbsp;·&nbsp; <kbd>←</kbd><kbd>→</kbd> tap once = blinker, tap again = change lanes &nbsp;·&nbsp; <kbd>P</kbd> pause</div>
         <button class="cta orange" id="startBtn">Start the route</button>
       </div>
     </div>
@@ -250,6 +250,11 @@ let brakeEpisode = false, brakeStartSpd = 0;
 let closeStops = 0, crossCars = [];
 let sideDwellT = 0;   // how long we've been lingering beside someone
 let bubbleWhy = '';   // what's limiting the cushion right now (front/side/rear/boxed)
+// v2: signals, lane closure, stalled car, pull-out
+let sigDir = 0, sigT = 0;                 // armed blinker: -1 left, 1 right
+let flashGos = 0, falseAlerts = 0;        // communication infractions
+let closure = null, pullout = null;       // course features
+let coneHitT = -9;
 let messageTimer = 0, lastMsgKey = '', msgCooldown = {};
 let flashT = 0;
 
@@ -276,9 +281,31 @@ function buildCourse(){
   }
   distanceGoal = y + 320;
 
-  // red-light runner at signal 4, ambulance after signal 5
+  // red-light runner at signal 4 (re-arms at later lights if conditions never line up),
+  // ambulance after signal 5
   events.runner = { sigIdx:4, state:'waiting', collided:false, done:false };
   events.amb = { triggerY: signals[5].y + 220, state:'idle', y:0, lane:1, done:false, complied:true };
+
+  // v2 course features — placed in distinct long blocks so they don't stack
+  closure = null; pullout = null;
+  const gaps = [];
+  for(let i=1;i<SIGNALS-1;i++) gaps.push({ i, from: signals[i].y, len: signals[i+1].y - signals[i].y });
+  gaps.sort((a,b)=>b.len-a.len);
+  if(gaps[0] && gaps[0].len > 700){
+    const g0 = gaps[0];
+    closure = { lane: Math.random()<0.5 ? 0 : LANES-1, taper: 130, warned:false,
+      yStart: g0.from + CROSS_W + 320, yEnd: g0.from + CROSS_W + 320 + 240 };
+  }
+  if(gaps[1] && gaps[1].len > 560){
+    const g1 = gaps[1];
+    const sl = Math.floor(Math.random()*LANES);
+    spawnCar(sl, g1.from + CROSS_W + g1.len*0.45, 0, 0);
+    const sc = cars[cars.length-1];
+    sc.stalled = true; sc.hazard = true; sc.col = '#7d8288'; sc.warned = false;
+  }
+  if(gaps[2] && gaps[2].len > 480){
+    pullout = { y: gaps[2].from + CROSS_W + gaps[2].len*0.5, state:'idle', t:0 };
+  }
 
   // seed traffic in PLATOONS — packs with open road between them, the way arterial traffic
   // actually flows. Pace well and you ride the gaps; race ahead and you live in the packs.
@@ -291,10 +318,17 @@ function buildCourse(){
     ty += 420 + Math.random()*560;
   }
   cullOverlaps();
+  // nobody seeds inside the lane closure
+  if(closure){
+    for(let i=cars.length-1;i>=0;i--){
+      const c = cars[i];
+      if(!c.stalled && c.lane===closure.lane && c.y > closure.yStart-380 && c.y < closure.yEnd+60) cars.splice(i,1);
+    }
+  }
 }
 function spawnCar(lane, y, spd, des){
   const base = (38+Math.random()*14)*MPH;
-  cars.push({ lane, y, spd: spd!==undefined? spd : base*0.9, des: des!==undefined? des : base,
+  cars.push({ lane, laneF: lane, y, spd: spd!==undefined? spd : base*0.9, des: des!==undefined? des : base,
     col: pickCarColor(), stopped:false });
 }
 function pickCarColor(){
@@ -318,9 +352,20 @@ function lightState(sig, t){
 }
 
 // ---------- traffic AI ----------
+function tryMergeCar(c, targetLane){
+  if(targetLane<0 || targetLane>=LANES) return false;
+  if(closure && targetLane===closure.lane && c.y > closure.yStart-380 && c.y < closure.yEnd+60) return false;
+  for(const o of cars){
+    if(o!==c && o.lane===targetLane && Math.abs(o.y-c.y) < 52) return false;
+  }
+  if(Math.round(player.laneF)===targetLane && Math.abs(player.y-c.y) < 65) return false;
+  c.lane = targetLane;
+  return true;
+}
 function updateCars(dt){
   cars.sort((a,b)=>a.y-b.y);
   for(const c of cars){
+    if(c.stalled){ c.spd = 0; c.braking = false; continue; }
     // leader constraint (same lane, incl. player)
     let gap = 1e9, leadSpd = 1e9;
     for(const o of cars){
@@ -345,6 +390,26 @@ function updateCars(dt){
       const dR = rs.y - STOPLINE_GAP - c.y;
       if(dR > 0 && dR < 340) target = Math.min(target, Math.max(0, (dR-8)*0.30));
     }
+    // vertical traffic yields to cross traffic occupying its path (last overlap source)
+    for(const cc of crossCars){
+      const dAhead = cc.ySlot - c.y;
+      if(dAhead > 0 && dAhead < 120 && Math.abs(cc.xFt - (c.lane+0.5)*LANE_W) < 15){
+        target = Math.min(target, Math.max(0, (dAhead - 24)*0.2));
+      }
+    }
+    // lane closure: merge out early; if boxed, slow at the taper until a gap opens
+    if(closure && c.lane===closure.lane && c.y > closure.yStart-460 && c.y < closure.yEnd){
+      if(!tryMergeCar(c, closure.lane===0 ? 1 : LANES-2)){
+        const dTaper = closure.yStart - closure.taper - c.y;
+        if(dTaper < 260) target = Math.min(target, Math.max(2, dTaper*0.15));
+      }
+    }
+    // stopped obstacle ahead that isn't a red light (stalled car etc.) → merge around it
+    if(gap < 220 && leadSpd < 6){
+      const s2 = nextSignal(c.y);
+      const nearRed = s2 && lightState(s2,simT).c!=='g' && (s2.y-c.y) < 320;
+      if(!nearRed){ tryMergeCar(c, c.lane+1) || tryMergeCar(c, c.lane-1); }
+    }
     // follow leader: keep ~1.7s, release queues snappily
     if(gap < 1e8){
       const want = Math.max(20, c.spd*1.7);
@@ -355,11 +420,20 @@ function updateCars(dt){
     if(c.spd < target) c.spd = Math.min(target, c.spd + 8*dt);
     else c.spd = Math.max(target, c.spd - 13*dt);
     c.y += c.spd*dt;
+    c.laneF += (c.lane - c.laneF) * Math.min(1, dt*4);   // lane changes glide, never teleport
   }
   // recycle: keep density near player (teleports only ever happen far off-screen)
   for(const c of cars){
-    if(c.y < player.y - 520){ c.y = player.y + viewNow*0.85 + 80 + Math.random()*380; c.lane = Math.floor(Math.random()*LANES); c.des=(38+Math.random()*14)*MPH; c.spd=c.des*0.8; c.col=pickCarColor(); }
-    else if(c.y > player.y + VIEW_FT + 620){ c.y = player.y - 460 - Math.random()*120; c.lane=Math.floor(Math.random()*LANES); c.des=(38+Math.random()*14)*MPH; c.spd=c.des; c.col=pickCarColor(); }
+    if(c.stalled && Math.abs(c.y - player.y) < 700) continue;   // the stalled car stays put while relevant
+    let moved = false;
+    if(c.y < player.y - 520){ c.y = player.y + viewNow*0.85 + 80 + Math.random()*380; moved = true; }
+    else if(c.y > player.y + VIEW_FT + 620){ c.y = player.y - 460 - Math.random()*120; moved = true; }
+    if(moved){
+      c.lane = Math.floor(Math.random()*LANES); c.laneF = c.lane;
+      c.des=(38+Math.random()*14)*MPH; c.spd=c.des*0.85; c.col=pickCarColor();
+      c.stalled = false; c.hazard = false;
+      if(closure && c.lane===closure.lane && c.y > closure.yStart-400 && c.y < closure.yEnd+60){ c.lane = 1; c.laneF = 1; }
+    }
   }
   // hard no-overlap clamp: followers physically cannot stack on their leader (no mid-screen despawns)
   cars.sort((a,b)=>b.y-a.y);   // front to back
@@ -454,6 +528,15 @@ function updatePlayer(dt){
     }
   } else { stoppedTime = 0; wasStopped = false; }
 
+  // cone strike: drifting into the closed lane costs you
+  if(closure && Math.abs(player.laneF - closure.lane) < 0.45
+     && player.y > closure.yStart - closure.taper - 20 && player.y < closure.yEnd
+     && simT - coneHitT > 2){
+    coneHitT = simT; collisions++; score = Math.max(0, score-80); flashT = 0.5;
+    player.spd = Math.min(player.spd, 22);
+    toast('<span class="big">🚧 Cones.</span> That lane was closed — merge early next time, not at the barrels.', 'bad', 3.0, 'conehit');
+  }
+
   // signal crossings
   for(const s of signals){
     if(!s.crossed && player.y > s.y){
@@ -472,17 +555,36 @@ function updatePlayer(dt){
 
 }
 function changeLane(dir){
-  if(!running||paused||finished) return;
+  if(!running||paused||finished) return false;
   const t = player.lane + dir;
-  if(t<0||t>=LANES) return;
+  if(t<0||t>=LANES) return false;
   // block if a car is right beside us in target lane
   for(const c of cars){
     if(c.lane===t && Math.abs(c.y-player.y) < (CAR_LEN+TRUCK_LEN)/2 + 6){
       toast('Car in your blind spot — that space is taken.', 'bad', 1.6, 'blind');
-      return;
+      return false;
     }
   }
   player.lane = t;
+  return true;
+}
+// two-tap signals: first tap arms the blinker, second tap commits the lane change,
+// opposite tap cancels, 4.5s with no move auto-cancels as a "false alert"
+function signalTap(dir){
+  if(!running||paused||finished) return;
+  if(sigDir === dir){
+    const quick = (simT - sigT) < 0.35;
+    if(changeLane(dir)){
+      if(quick){ flashGos++; toast('<b>Flash-and-go.</b> Give people a beat to see the blinker before you move.', 'bad', 2.4, 'flashgo', 6); }
+      sigDir = 0;
+    } else {
+      sigT = simT;   // still waiting on a gap — don't call it a false alert
+    }
+  } else if(sigDir !== 0){
+    sigDir = 0;      // opposite tap = cancel
+  } else {
+    sigDir = dir; sigT = simT;
+  }
 }
 
 // ---------- bubble / space cushion ----------
@@ -542,6 +644,8 @@ function updateEvents(dt){
   const r = events.runner, rsig = signals[r.sigIdx];
   if(!r.done){
     const d = rsig.y - player.y;
+    // missed the window (arrived on red / band never cleared)? re-arm at the next light
+    if(r.state==='waiting' && player.y > rsig.y + 20 && r.sigIdx < SIGNALS-1) r.sigIdx++;
     if(r.state==='waiting' && d < 380 && d > 60 && lightState(rsig,simT).c==='g'){
       // wait for a clear band so the runner doesn't plow scenery cars
       const bandClear = !cars.some(c => c.y > rsig.y - CROSS_W - 14 && c.y < rsig.y + 8);
@@ -564,6 +668,40 @@ function updateEvents(dt){
       }
     }
   }
+  // side-street pull-out: noses out first (the telegraph), then commits into the right lane
+  if(pullout && pullout.state!=='done'){
+    const dp = pullout.y - player.y;
+    if(pullout.state==='idle' && dp < 380 && dp > 120){
+      pullout.state='nosing'; pullout.t=0;
+      toast('👀 <b>Nose poking out on the right.</b> They\'re telling you what they\'re about to do.', '', 2.8, 'pullout');
+    }
+    if(pullout.state==='nosing'){
+      pullout.t += dt;
+      if(pullout.t > 1.5){
+        const lane = LANES-1;
+        const clear = !cars.some(o => o.lane===lane && Math.abs(o.y - pullout.y) < 50);
+        if(clear){
+          spawnCar(lane, pullout.y, 9*MPH, 26*MPH);
+          const nc = cars[cars.length-1];
+          nc.laneF = LANES - 0.35;   // glides in from the shoulder
+          pullout.state='done';
+        } else if(pullout.t > 4){ pullout.state='done'; }   // traffic too thick — they wait, we move on
+      }
+    }
+  }
+
+  // course-feature coaching (fires once each)
+  if(closure && !closure.warned && closure.yStart - player.y < 620 && closure.yStart - player.y > 280){
+    closure.warned = true;
+    toast(`🚧 <b>${closure.lane===0?'LEFT':'RIGHT'} lane closed ahead.</b> Signal and merge early — early decisions beat fast ones.`, '', 3.2, 'cones');
+  }
+  for(const c of cars){
+    if(c.stalled && !c.warned && c.y - player.y < 560 && c.y - player.y > 260){
+      c.warned = true;
+      toast('⚠️ <b>Stalled car ahead, hazards on.</b> Your eye lead just paid for itself — plan the lane now.', '', 3.0, 'stalled');
+    }
+  }
+
   const a = events.amb;
   if(!a.done){
     if(a.state==='idle' && player.y > a.triggerY){
@@ -643,12 +781,15 @@ function updateCross(dt){
     if(!c.turnRolled && c.xFt > 4 && c.xFt < ROAD_FT-4){
       c.turnRolled = true;
       if(Math.random() < 0.22){
-        const lane = Math.max(0, Math.min(LANES-1, Math.floor(c.xFt/LANE_W)));
+        // turn onto the nearest edge lane and GLIDE in (no teleport-rotate)
+        const lane = c.dir>0 ? 0 : LANES-1;
         const ty = c.ySlot + 45;
         const clear = !cars.some(o => o.lane===lane && Math.abs(o.y - ty) < 45)
           && !(Math.round(player.laneF)===lane && Math.abs(player.y - ty) < 60);
         if(clear){
           spawnCar(lane, ty, 12*MPH, 26*MPH);
+          const nc = cars[cars.length-1];
+          nc.laneF = Math.max(-0.7, Math.min(LANES-0.3, c.xFt/LANE_W - 0.5));
           crossCars.splice(i,1);
           continue;
         }
@@ -700,9 +841,11 @@ function computeGrades(){
   const integEff = Math.max(0, integ - closeStops*5);   // tight stops eat into cushion credit
   const cushion = g(integEff,[92,84,74,60]);
   const smooth = smoothPen===0?['E',5]:smoothPen<=2?['G',4]:smoothPen<=4?['I',3]:smoothPen<=6?['A',2]:['P',1];
-  const avg = (pacing[1]+cushion[1]+smooth[1])/3;
+  const commPen = flashGos + falseAlerts;
+  const comm = commPen===0?['E',5]:commPen===1?['G',4]:commPen===2?['I',3]:commPen===3?['A',2]:['P',1];
+  const avg = (pacing[1]+cushion[1]+smooth[1]+comm[1])/4;
   const overall = avg>=4.6?['E','Excellent']:avg>=3.5?['G','Great']:avg>=2.5?['I','Inconsistent']:avg>=1.5?['A','Attention Needed']:['P','Poor'];
-  return {pacing, cushion, smooth, overall, integ, pacedCount};
+  return {pacing, cushion, smooth, comm, overall, integ, pacedCount};
 }
 
 // ---------- UI helpers ----------
@@ -728,8 +871,8 @@ function updateHUD(){
   hb.style.color = bubbleNow>80?'#7fd99a':bubbleNow>50?'#ffd23f':'#ff8177';
   $('hBubbleLab').textContent = bubbleWhy ? 'Cushion · ' + bubbleWhy : 'Cushion';
 
-  // lights-ahead strip
-  const ahead = signals.filter(s=>s.y > player.y - CROSS_W).slice(0,2);
+  // lights-ahead strip (hands off to the next light once you cross the stop line)
+  const ahead = signals.filter(s=>s.y - player.y > 20).slice(0,2);
   for(let i=0;i<2;i++){
     const el = $('la'+i), dot = el.querySelector('.dot'), d1 = el.querySelector('.d1'), d2 = el.querySelector('.d2');
     if(ahead[i]){
@@ -848,19 +991,72 @@ function draw(){
     for(let x=left; x<right; x+=18) ctx.fillRect(x, fy-6, 9, 12);
   }
 
+  // lane closure: warning sign, hatched closed lane, cone taper + cone line
+  if(closure){
+    const signY = yToScreen(closure.yStart - closure.taper - 420);
+    if(signY > -40 && signY < H+40){
+      const sx = closure.lane===0 ? left - 34 : right + 8;
+      ctx.fillStyle = '#EF8B22'; rr(sx, signY-22, 26, 34, 4); ctx.fill();
+      ctx.fillStyle = '#27343D'; ctx.font = '700 9px Roboto, sans-serif';
+      ctx.textAlign = 'center'; ctx.textBaseline = 'middle';
+      ctx.fillText('LANE', sx+13, signY-10);
+      ctx.fillText('CLOSED', sx+13, signY+1);
+      ctx.fillText(closure.lane===0?'⟶':'⟵', sx+13, signY+13);
+    }
+    const laneLeft = left + closure.lane*laneW();
+    const y1 = yToScreen(closure.yEnd), y2 = yToScreen(closure.yStart);
+    if(y1 < H+80 && y2 > -80){
+      // hatch the closed stretch
+      ctx.save();
+      ctx.fillStyle = 'rgba(239,139,34,.10)';
+      ctx.fillRect(laneLeft, Math.max(-10,y1), laneW(), Math.min(H+10,y2)-Math.max(-10,y1));
+      ctx.restore();
+    }
+    // cones: taper diagonally across the lane, then hold the inner edge
+    const innerX = closure.lane===0 ? laneLeft + laneW() - 3 : laneLeft + 3;
+    const outerX = closure.lane===0 ? laneLeft + 3 : laneLeft + laneW() - 3;
+    for(let f=0; f<=1.001; f+=0.2){
+      const wy = closure.yStart - closure.taper + f*closure.taper;
+      const sy2 = yToScreen(wy);
+      if(sy2<-20||sy2>H+20) continue;
+      drawCone(outerX + (innerX-outerX)*f, sy2);
+    }
+    for(let wy=closure.yStart+34; wy<closure.yEnd; wy+=42){
+      const sy2 = yToScreen(wy);
+      if(sy2<-20||sy2>H+20) continue;
+      drawCone(innerX, sy2);
+    }
+  }
+
+  // pull-out car nosing off the right shoulder (the telegraph)
+  if(pullout && pullout.state==='nosing'){
+    const sy2 = yToScreen(pullout.y);
+    if(sy2>-60 && sy2<H+60){
+      const prog = Math.min(1, pullout.t/1.5);
+      const cx2 = right + CAR_W*pxFt*LAT*0.75 - prog*laneW()*0.45;
+      drawCar(cx2, sy2, CAR_LEN*pxFt, CAR_W*pxFt*LAT, '#9db3a4', false, false);
+      if(Math.floor(simT*3)%2===0){   // its left blinker — it's telling you
+        ctx.save(); ctx.shadowColor='#ffb340'; ctx.shadowBlur=10; ctx.fillStyle='#ffb340';
+        ctx.fillRect(cx2 - CAR_W*pxFt*LAT/2 - 2, sy2 - CAR_LEN*pxFt + 3, 5, 6);
+        ctx.fillRect(cx2 - CAR_W*pxFt*LAT/2 - 2, sy2 - 9, 5, 6);
+        ctx.restore();
+      }
+    }
+  }
+
   // cross traffic (horizontal cars in intersections)
   for(const c of crossCars){
     const sy = yToScreen(c.ySlot);
     if(sy<-80||sy>H+80) continue;
     const cx = left + c.xFt*(laneW()/LANE_W);
-    drawCrossCar(cx, sy, c.col, c.dir);
+    drawCrossCar(cx, sy, c.col, c.dir, c.reckless);
   }
 
   // cars
   for(const c of cars){
     const sy = yToScreen(c.y);
     if(sy<-80||sy>H+80) continue;
-    drawCar(laneToX(c.lane), sy, CAR_LEN*pxFt, CAR_W*pxFt*LAT, c.col, c.braking);
+    drawCar(laneToX(c.laneF), sy, CAR_LEN*pxFt, CAR_W*pxFt*LAT, c.col, c.braking, c.hazard);
   }
 
   // 15-ft stop guide: appears behind a slow/stopped car you're closing on
@@ -925,7 +1121,7 @@ function draw(){
   if(flashT>0){ ctx.fillStyle = `rgba(204,1,0,${Math.min(.35,flashT*.5)})`; ctx.fillRect(0,0,W,H); }
 }
 function rr(x,y,w,h,r){ ctx.beginPath(); ctx.roundRect(x,y,w,h,r); }
-function drawCar(cx, cyBottom, len, wid, col, braking){
+function drawCar(cx, cyBottom, len, wid, col, braking, hazard){
   const x = cx-wid/2, y = cyBottom-len;
   ctx.fillStyle = 'rgba(0,0,0,.25)'; rr(x+2,y+3,wid,len,5); ctx.fill();
   ctx.fillStyle = col; rr(x,y,wid,len,5); ctx.fill();
@@ -938,6 +1134,14 @@ function drawCar(cx, cyBottom, len, wid, col, braking){
     ctx.fillStyle = '#ff3b30';
     ctx.fillRect(x+wid*.08, cyBottom-3, wid*.26, 3);
     ctx.fillRect(x+wid*.66, cyBottom-3, wid*.26, 3);
+    ctx.restore();
+  }
+  if(hazard && Math.floor(simT*2.5)%2===0){
+    ctx.save();
+    ctx.shadowColor = '#ffb340'; ctx.shadowBlur = 9;
+    ctx.fillStyle = '#ffb340';
+    ctx.fillRect(x-1, y+2, 4, 4);       ctx.fillRect(x+wid-3, y+2, 4, 4);
+    ctx.fillRect(x-1, cyBottom-6, 4, 4); ctx.fillRect(x+wid-3, cyBottom-6, 4, 4);
     ctx.restore();
   }
 }
@@ -966,10 +1170,38 @@ function drawTruck(cx, cyBottom){
     ctx.fillRect(x+wid*.66, cyBottom-4, wid*.26, 4);
     ctx.restore();
   }
+  // armed blinker: front + rear amber on the signaled side
+  if(sigDir !== 0 && Math.floor(simT*3)%2===0){
+    const bx = sigDir<0 ? x-2 : x+wid-4;
+    ctx.save();
+    ctx.shadowColor = '#ffb340'; ctx.shadowBlur = 12;
+    ctx.fillStyle = '#ffb340';
+    ctx.fillRect(bx, y+3, 6, 7);
+    ctx.fillRect(bx, cyBottom-10, 6, 7);
+    ctx.restore();
+  }
 }
-function drawCrossCar(cx, cy, col, dir){
+function drawCone(x, y){
+  ctx.save();
+  ctx.shadowColor = '#EF8B22'; ctx.shadowBlur = 5;
+  ctx.fillStyle = '#EF8B22';
+  ctx.beginPath(); ctx.arc(x, y, 4.5, 0, Math.PI*2); ctx.fill();
+  ctx.shadowBlur = 0;
+  ctx.strokeStyle = '#fff'; ctx.lineWidth = 1.5;
+  ctx.beginPath(); ctx.arc(x, y, 2.4, 0, Math.PI*2); ctx.stroke();
+  ctx.restore();
+}
+function drawCrossCar(cx, cy, col, dir, reckless){
   const len = CAR_LEN*pxFt*1.5, wid = CAR_W*pxFt*1.5;   // horizontal: length along x
   const x = cx-len/2, y = cy-wid/2;
+  if(reckless){   // speed streaks — this one is MOVING
+    ctx.save(); ctx.globalAlpha = 0.5;
+    for(let k=1;k<=3;k++){
+      ctx.fillStyle = `rgba(168,60,48,${0.4/k})`;
+      rr(x - dir*len*0.45*k, y+wid*.2, len*.5, wid*.6, 3); ctx.fill();
+    }
+    ctx.restore();
+  }
   ctx.fillStyle='rgba(0,0,0,.25)'; rr(x+2,y+3,len,wid,4); ctx.fill();
   ctx.fillStyle=col; rr(x,y,len,wid,4); ctx.fill();
   ctx.fillStyle='rgba(20,28,34,.5)';
@@ -1005,6 +1237,11 @@ function step(dt){
   pxFt = H / viewNow;
   if(flashT>0) flashT -= dt;
   if(messageTimer>0){ messageTimer -= dt; if(messageTimer<=0) $('toast').classList.remove('show'); }
+  // signal auto-cancel: blinking with no move = false alert (doctrine: signals at the correct time)
+  if(sigDir !== 0 && simT - sigT > 4.5){
+    sigDir = 0; falseAlerts++;
+    toast('Blinker with no move — <b>false alerts teach people to ignore you.</b>', 'bad', 2.6, 'falsealert', 8);
+  }
 
   updatePlayer(dt);
   updateCars(dt);
@@ -1031,6 +1268,7 @@ function finish(){
     ['Light pacing', g.pacing, `${g.pacedCount} of ${SIGNALS} lights paced · ${stops} full stop${stops===1?'':'s'}`],
     ['Space cushion', g.cushion, `${g.integ}% cushion integrity` + (closeStops? ` · ${closeStops} stop${closeStops===1?'':'s'} tighter than 15 ft` : ' · every stop left 15 ft')],
     ['Smooth & safe', g.smooth, `${hardBrakes} hard brake${hardBrakes===1?'':'s'} · ${collisions} incident${collisions===1?'':'s'}`],
+    ['Signals & communication', g.comm, (flashGos+falseAlerts)===0 ? 'clean blinker work all route' : `${flashGos} flash-and-go${flashGos===1?'':'s'} · ${falseAlerts} false alert${falseAlerts===1?'':'s'}`],
   ];
   $('gradeRows').innerHTML = rows.map(([name,gr,det])=>`
     <div class="gradeRow"><div class="g bebas g${gr[0]}">${gr[0]}</div>
@@ -1055,6 +1293,7 @@ function startRun(){
   bubbleAcc=0; bubbleSamples=0; bubbleNow=100; simT=0;
   stoppedTime=0; wasStopped=false; throttleIntegral=0; msgCooldown={};
   brakeEpisode=false; brakeStartSpd=0; closeStops=0; crossCars=[]; sideDwellT=0;
+  sigDir=0; sigT=0; flashGos=0; falseAlerts=0; coneHitT=-9;
   finished=false; paused=false; running=true;
   $('startOverlay').classList.add('hidden');
   $('endOverlay').classList.add('hidden');
@@ -1074,8 +1313,8 @@ function bindInput(){
     if(e.repeat) return;
     if(e.key==='ArrowUp'||e.key==='w'||e.key==='W') player.gas=true;
     if(e.key==='ArrowDown'||e.key==='s'||e.key==='S') player.brake=true;
-    if(e.key==='ArrowLeft'||e.key==='a'||e.key==='A') changeLane(-1);
-    if(e.key==='ArrowRight'||e.key==='d'||e.key==='D') changeLane(1);
+    if(e.key==='ArrowLeft'||e.key==='a'||e.key==='A') signalTap(-1);
+    if(e.key==='ArrowRight'||e.key==='d'||e.key==='D') signalTap(1);
     if(e.key==='p'||e.key==='P') setPause(!paused);
     if(e.key===' ' && (finished || !running)){ e.preventDefault(); startRun(); }
     if(['ArrowUp','ArrowDown','ArrowLeft','ArrowRight',' '].includes(e.key)) e.preventDefault();
@@ -1096,12 +1335,12 @@ function bindInput(){
   };
   hold('btnGas', ()=>player.gas=true, ()=>player.gas=false);
   hold('btnBrake', ()=>player.brake=true, ()=>player.brake=false);
-  hold('btnLeft', ()=>changeLane(-1));
-  hold('btnRight', ()=>changeLane(1));
+  hold('btnLeft', ()=>signalTap(-1));
+  hold('btnRight', ()=>signalTap(1));
 
   if(matchMedia('(pointer:coarse)').matches){
     document.body.classList.add('touchOn');
-    $('keyHelp').innerHTML = 'Hold <b>▲ gas</b> / <b>▼ brake</b> · tap <b>◀ ▶</b> to change lanes';
+    $('keyHelp').innerHTML = 'Hold <b>▲ gas</b> / <b>▼ brake</b> · tap <b>◀ ▶</b> once = blinker, again = change lanes';
   }
 
   $('startBtn').addEventListener('click', startRun);
@@ -1122,7 +1361,9 @@ window.addEventListener('load', ()=>{
   draw(); updateHUD();
   requestAnimationFrame(frame);
   // test/debug handle (harmless in production)
-  window.__g = { player, start:startRun, lane:changeLane, tick:step,
+  window.__g = { player, start:startRun, lane:changeLane, tap:signalTap, tick:step,
+    course:()=>({closure: closure? {lane:closure.lane, yStart:Math.round(closure.yStart), yEnd:Math.round(closure.yEnd)}:null,
+      stalled: (cars.find(c=>c.stalled)||{}).y, pullout: pullout? {y:Math.round(pullout.y), state:pullout.state}:null}),
     ev:()=>({r:events.runner.state, rc:events.runner.collided, a:events.amb.state, ac:events.amb.complied}),
     cross:()=>crossCars.map(c=>({sig:c.sig, x:Math.round(c.xFt), ySlot:Math.round(c.ySlot), dy:Math.round(c.ySlot-player.y)})),
     signals:()=>signals.map(s=>({y:s.y, paced:s.paced, crossed:s.crossed, st:lightState(s,simT).c})),
