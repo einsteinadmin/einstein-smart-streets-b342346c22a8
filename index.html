@@ -236,7 +236,7 @@ const STOPLINE_GAP = 15*FT;        // "stop 15 feet behind crosswalks"
 // light cycle — long greens so riding the wave strings 2-3 greens together
 const G_TIME = 12.5, Y_TIME = 3.2, R_TIME = 9.5;
 const CYCLE = G_TIME + Y_TIME + R_TIME;
-const GAME_VERSION = 'v3.2 · Jul 3';
+const GAME_VERSION = 'v3.3 · Jul 3';
 
 // ---------- state ----------
 let cv, ctx, W, H, pxFt, DPR;
@@ -429,10 +429,11 @@ function updateCars(dt){
       if(sig.stop){
         // 4-way stop protocol: slow in, hold ~1s at the line, then proceed
         if(c.ssClearedId !== sig.id && dStop > -6 && dStop < 340){
-          target = Math.min(target, Math.max(0, (dStop-6)*0.28));
+          // brisk to the line (real 4-way throughput ~2-3s per car), full stop, short hold
+          target = Math.min(target, Math.max(0, (dStop-6)*0.55));
           if(dStop < 12 && c.spd < 1.5){
             c.ssWait = (c.ssWait||0) + dt;
-            if(c.ssWait > 0.6){ c.ssClearedId = sig.id; c.ssWait = 0; }
+            if(c.ssWait > 0.45){ c.ssClearedId = sig.id; c.ssWait = 0; }
           }
         }
       } else {
@@ -501,8 +502,9 @@ function updateCars(dt){
     }
     // follow leader: keep ~1.7s, release queues snappily
     if(gap < 1e8){
-      const want = Math.max(20, c.spd*1.7);
-      if(gap < want) target = Math.min(target, leadSpd - (want-gap)*0.3);
+      const nearSS = sig && sig.stop && (sig.y - c.y) < 340 && (sig.y - c.y) > -6;
+      const want = Math.max(nearSS ? 12 : 20, c.spd*1.7);   // stop-sign queues pack tighter + roll up faster
+      if(gap < want) target = Math.min(target, leadSpd - (want-gap)*(nearSS ? 0.5 : 0.3));
     }
     target = Math.max(0, target);
     c.braking = target < c.spd - 2;   // decelerating with intent → brake lights
@@ -528,7 +530,7 @@ function updateCars(dt){
       c.des=(38+Math.random()*14)*MPH; c.spd=c.des*0.85; c.col=pickCarColor();
       c.stalled = false; c.hazard = false;
       for(const s of signals){
-        if(s.stop && c.y > s.y - 650 && c.y < s.y + 40 && Math.random() < 0.75){ c.y = s.y + 140 + Math.random()*320; break; }
+        if(s.stop && c.y > s.y - 900 && c.y < s.y + 40){ c.y = s.y + 140 + Math.random()*320; break; }
       }
       if(closure && closure.lanes.includes(c.lane) && c.y > closure.yStart-400 && c.y < closure.yEnd+60){ c.lane = closure.openLane!==undefined?closure.openLane:1; c.laneF = c.lane; }
     }
