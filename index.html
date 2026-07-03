@@ -236,7 +236,7 @@ const STOPLINE_GAP = 15*FT;        // "stop 15 feet behind crosswalks"
 // light cycle — long greens so riding the wave strings 2-3 greens together
 const G_TIME = 12.5, Y_TIME = 3.2, R_TIME = 9.5;
 const CYCLE = G_TIME + Y_TIME + R_TIME;
-const GAME_VERSION = 'v3.3 · Jul 3';
+const GAME_VERSION = 'v3.4 · Jul 3';
 
 // ---------- state ----------
 let cv, ctx, W, H, pxFt, DPR;
@@ -879,8 +879,13 @@ function updateEvents(dt){
         }
         a.lane = best;
       }
+      // hard clamp: behind a dead-stopped queue the ambulance WAITS like anyone else — never through cars
+      let wall = 1e9;
+      const aLane = Math.round(a.laneF);
+      for(const c of cars){ if(Math.round(c.laneF)===aLane && c.y>a.y && c.y-a.y<wall) wall = c.y-a.y; }
+      if(Math.round(player.laneF)===aLane && player.y>a.y) wall = Math.min(wall, player.y-a.y);
       const ambSpd = (72*MPH/1.6) * (blockD < 70 ? 0.22 : 1);
-      a.y += ambSpd*dt;
+      a.y += Math.min(ambSpd*dt, Math.max(0, wall - 30));
       // it steers AROUND you — never through you
       if(Math.abs(a.y - player.y) < 280 && a.lane === Math.round(player.laneF)){
         a.lane = player.lane===0 ? 1 : player.lane===LANES-1 ? LANES-2 : (Math.random()<0.5?0:LANES-1);
@@ -1659,7 +1664,7 @@ window.addEventListener('load', ()=>{
   window.__g = { player, cars:()=>cars, start:startRun, lane:changeLane, tap:signalTap, tick:step,
     course:()=>({closure: closure? {lane:closure.lane, yStart:Math.round(closure.yStart), yEnd:Math.round(closure.yEnd)}:null,
       stalled: (cars.find(c=>c.stalled)||{}).y, pullout: pullout? {y:Math.round(pullout.y), state:pullout.state}:null}),
-    ev:()=>({r:events.runner.state, rc:events.runner.collided, a:events.amb.state, ac:events.amb.complied}),
+    ev:()=>({r:events.runner.state, rc:events.runner.collided, a:events.amb.state, ac:events.amb.complied, ay:Math.round(events.amb.y||0), alane:events.amb.laneF}),
     cross:()=>crossCars.map(c=>({sig:c.sig, x:Math.round(c.xFt), ySlot:Math.round(c.ySlot), dy:Math.round(c.ySlot-player.y)})),
     signals:()=>signals.map(s=>({y:s.y, paced:s.paced, crossed:s.crossed, stop:!!s.stop, st: s.stop?'stop':lightState(s,simT).c})),
     state:()=>({simT,running,paused,finished,score,stops,collisions,hardBrakes,closeStops,crossN:crossCars.length,bubbleNow,y:player.y,spd:player.spd,lane:player.lane,
