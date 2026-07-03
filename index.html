@@ -194,7 +194,7 @@
         <div id="overallGrade" class="bebas gG">G</div>
         <div id="overallWord">Great</div>
         <div id="finalScore">Score: 0</div>
-        <div style="font-size:10.5px;color:var(--grey-400);margin:-8px 0 12px;line-height:1.5">+100 paced light · +150 scan &amp; yield saves · −60 full stop · −80 to −250 incidents</div>
+        <div style="font-size:10.5px;color:var(--grey-400);margin:-8px 0 12px;line-height:1.5">+100 paced light · +150 scan &amp; yield saves · +pace bonus · −60 full stop · −80 to −250 incidents</div>
         <div id="gradeRows"></div>
         <div id="doctrineLine"></div>
         <button class="cta orange" id="againBtn">Run it back</button>
@@ -221,8 +221,8 @@ const MPH = 1.46667;               // mph -> ft/s
 const LANES = 3, LANE_W = 12*FT;
 const TRUCK_LEN = 26*FT, TRUCK_W = 8.4*FT;
 const CAR_LEN = 15*FT, CAR_W = 6.6*FT;
-const MAX_SPD = 45*MPH;            // 66 ft/s
-const ACCEL = 7.5, BRAKE = 16, COAST = 3.4;         // ft/s^2 (coast = engine braking; makes pacing playable)
+const MAX_SPD = 55*MPH;            // ~81 ft/s — Hino 268 with arcade courage
+const ACCEL = 8.5, BRAKE = 16, COAST = 3.4;         // ft/s^2 (coast = engine braking; makes pacing playable)
 const HARD_BRAKE_SHED = 26;                          // ft/s (~18 mph) shed in one brake episode = hard brake
 const VIEW_FT = 850;               // max feet of road visible (recycle bounds use this)
 const VIEW_SLOW = 480;             // view when stopped; camera zooms out with speed toward VIEW_FT
@@ -235,7 +235,7 @@ const STOPLINE_GAP = 15*FT;        // "stop 15 feet behind crosswalks"
 // light cycle — long greens so riding the wave strings 2-3 greens together
 const G_TIME = 12.5, Y_TIME = 3.2, R_TIME = 9.5;
 const CYCLE = G_TIME + Y_TIME + R_TIME;
-const GAME_VERSION = 'v2.1 · Jul 3';
+const GAME_VERSION = 'v2.2 · Jul 3';
 
 // ---------- state ----------
 let cv, ctx, W, H, pxFt, DPR;
@@ -898,9 +898,12 @@ function computeGrades(){
   const smooth = smoothPen===0?['E',5]:smoothPen<=2?['G',4]:smoothPen<=4?['I',3]:smoothPen<=6?['A',2]:['P',1];
   const commPen = flashGos + falseAlerts;
   const comm = commPen===0?['E',5]:commPen===1?['G',4]:commPen===2?['I',3]:commPen===3?['A',2]:['P',1];
-  const avg = (pacing[1]+cushion[1]+smooth[1]+comm[1])/4;
+  // traffic pace: floating at 15 mph with a perfect cushion is not the job
+  const avgMph = simT > 0 ? (player.y / simT) / MPH : 0;
+  const pace = avgMph>=25?['E',5]:avgMph>=21.5?['G',4]:avgMph>=18?['I',3]:avgMph>=14?['A',2]:['P',1];
+  const avg = (pacing[1]+cushion[1]+smooth[1]+comm[1]+pace[1])/5;
   const overall = avg>=4.6?['E','Excellent']:avg>=3.5?['G','Great']:avg>=2.5?['I','Inconsistent']:avg>=1.5?['A','Attention Needed']:['P','Poor'];
-  return {pacing, cushion, smooth, comm, overall, integ, pacedCount};
+  return {pacing, cushion, smooth, comm, pace, avgMph, overall, integ, pacedCount};
 }
 
 // ---------- UI helpers ----------
@@ -920,6 +923,8 @@ function bonus(txt){
 }
 function updateHUD(){
   $('hSpeed').textContent = Math.round(player.spd/MPH);
+  const tm = Math.floor(simT/60), ts2 = String(Math.floor(simT%60)).padStart(2,'0');
+  document.querySelector('#scorePill .lab').textContent = 'Score · ' + tm + ':' + ts2;
   $('hStops').textContent = stops;
   $('hScore').textContent = score;
   const hb = $('hBubble'); hb.textContent = bubbleNow + '%';
@@ -1335,11 +1340,16 @@ function frame(ts){
 function finish(){
   finished = true;
   const g = computeGrades();
+  // pace bonus: efficiency pays — but only on top of clean driving, never instead of it
+  const paceBonus = Math.max(0, Math.round((g.avgMph - 14) * 25));
+  score += paceBonus;
+  const mm = Math.floor(simT/60), ss = String(Math.round(simT%60)).padStart(2,'0');
   const rows = [
     ['Light pacing', g.pacing, `${g.pacedCount} of ${SIGNALS} lights paced · ${stops} full stop${stops===1?'':'s'}`],
     ['Space cushion', g.cushion, `${g.integ}% cushion integrity` + (closeStops? ` · ${closeStops} stop${closeStops===1?'':'s'} tighter than 15 ft` : ' · every stop left 15 ft')],
     ['Smooth & safe', g.smooth, `${hardBrakes} hard brake${hardBrakes===1?'':'s'} · ${collisions} incident${collisions===1?'':'s'}`],
     ['Signals & communication', g.comm, (flashGos+falseAlerts)===0 ? 'clean blinker work all route' : `${flashGos} flash-and-go${flashGos===1?'':'s'} · ${falseAlerts} false alert${falseAlerts===1?'':'s'}`],
+    ['Traffic pace', g.pace, `${g.avgMph.toFixed(1)} mph average · route time ${mm}:${ss} · pace bonus +${paceBonus}`],
   ];
   $('gradeRows').innerHTML = rows.map(([name,gr,det])=>`
     <div class="gradeRow"><div class="g bebas g${gr[0]}">${gr[0]}</div>
