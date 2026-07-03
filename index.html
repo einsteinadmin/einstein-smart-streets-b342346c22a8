@@ -45,6 +45,7 @@
   .la .dot.g{background:#37c96f;box-shadow:0 0 10px #37c96f}
   .la .dot.y{background:#ffd23f;box-shadow:0 0 10px #ffd23f}
   .la .dot.r{background:#ff5545;box-shadow:0 0 10px #ff5545}
+  .la .dot.stopSign{background:#CC0100;border-radius:4px;box-shadow:0 0 10px #CC0100;transform:rotate(22.5deg)}
   .la .txt{display:flex;flex-direction:column;line-height:1.1;min-width:0}
   .la .d1{font-size:12px;font-weight:700;white-space:nowrap}
   .la .d2{font-size:10px;color:var(--navy-100);white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
@@ -169,7 +170,7 @@
           <div class="habit"><div class="ic">🛟</div><div><b>Surround yourself with space</b>
             <span>Protect the cushion around your truck. Ease off and roll on to keep traffic out of it — and when you do stop, stop 15 feet back.</span></div></div>
           <div class="habit"><div class="ic">🚦</div><div><b>Light pacing — try to never stop</b>
-            <span>"When a light is green, prepare to slow. When a light is red, prepare to go." Time it so you're still rolling.</span></div></div>
+            <span>"When a light is green, prepare to slow. When a light is red, prepare to go." Time it so you're still rolling. Stop signs are the opposite — those are ALWAYS a full stop.</span></div></div>
         </div>
         <div class="keys" id="keyHelp"><kbd>↑</kbd> gas &nbsp;·&nbsp; <kbd>↓</kbd> brake &nbsp;·&nbsp; <kbd>←</kbd><kbd>→</kbd> tap once = blinker, tap again = change lanes &nbsp;·&nbsp; <kbd>P</kbd> pause</div>
         <button class="cta orange" id="startBtn">Start the route</button>
@@ -235,7 +236,7 @@ const STOPLINE_GAP = 15*FT;        // "stop 15 feet behind crosswalks"
 // light cycle — long greens so riding the wave strings 2-3 greens together
 const G_TIME = 12.5, Y_TIME = 3.2, R_TIME = 9.5;
 const CYCLE = G_TIME + Y_TIME + R_TIME;
-const GAME_VERSION = 'v2.2 · Jul 3';
+const GAME_VERSION = 'v3.0 · overnight build · Jul 3';
 
 // ---------- state ----------
 let cv, ctx, W, H, pxFt, DPR;
@@ -256,6 +257,7 @@ let bubbleWhy = '';   // what's limiting the cushion right now (front/side/rear/
 // v2: signals, lane closure, stalled car, pull-out
 let sigDir = 0, sigT = 0;                 // armed blinker: -1 left, 1 right
 let flashGos = 0, falseAlerts = 0;        // communication infractions
+let ssClean = 0, ssRolled = 0, creeps = 0; // stop-sign compliance + crept-past-the-line count
 let closure = null, pullout = null;       // course features
 let coneHitT = -9;
 let zones = [];                           // traffic-density zones along the course
@@ -280,14 +282,22 @@ function buildCourse(){
     if(breaker) phase = (phase + G_TIME + 1.5 + Math.random()*3) % CYCLE;
     phase = (phase + (Math.random()*3 - 1.5) + CYCLE) % CYCLE;   // small jitter
     signals.push({
-      y, phase, breaker, id:i,
-      paced:false, scoredStop:false, crossed:false, approachStopped:false
+      y, phase, breaker, id:i, stop:false,
+      paced:false, scoredStop:false, crossed:false, approachStopped:false,
+      lineChecked:false, playerStopped:false
     });
     // block-length variety: short city blocks, medium, and long open stretches
     const r2 = Math.random();
     y += r2<0.3 ? 400+Math.random()*180 : r2<0.75 ? 620+Math.random()*300 : 950+Math.random()*450;
   }
   distanceGoal = y + 320;
+
+  // two junctions are 4-WAY STOPS — the counterweight lesson: some stops are mandatory
+  {
+    const candidates = [2,3,5,6,7,8].sort(()=>Math.random()-0.5);
+    signals[candidates[0]].stop = true;
+    signals[candidates[1]].stop = true;
+  }
 
   // red-light runner at signal 4 (re-arms at later lights if conditions never line up),
   // ambulance after signal 5
@@ -400,11 +410,22 @@ function updateCars(dt){
     let target = c.des;
     const sig = nextSignal(c.y);
     if(sig){
-      const st = lightState(sig, simT);
       const dStop = sig.y - STOPLINE_GAP - c.y;
-      // AI cars light-pace a little too: ease off early, arrive slow — queues release rolling
-      if((st.c==='r' || (st.c==='y' && dStop > c.spd*1.2)) && dStop>0 && dStop < 340){
-        target = Math.min(target, Math.max(0, (dStop-8)*0.30));
+      if(sig.stop){
+        // 4-way stop protocol: slow in, hold ~1s at the line, then proceed
+        if(c.ssClearedId !== sig.id && dStop > -6 && dStop < 340){
+          target = Math.min(target, Math.max(0, (dStop-6)*0.28));
+          if(dStop < 12 && c.spd < 1.5){
+            c.ssWait = (c.ssWait||0) + dt;
+            if(c.ssWait > 0.9){ c.ssClearedId = sig.id; c.ssWait = 0; }
+          }
+        }
+      } else {
+        const st = lightState(sig, simT);
+        // AI cars light-pace a little too: ease off early, arrive slow — queues release rolling
+        if((st.c==='r' || (st.c==='y' && dStop > c.spd*1.2)) && dStop>0 && dStop < 340){
+          target = Math.min(target, Math.max(0, (dStop-8)*0.30));
+        }
       }
     }
     // traffic REACTS to the red-light runner — brake lights ripple before he's in your path
@@ -423,8 +444,12 @@ function updateCars(dt){
           if(c.lane===edge || tryMergeCar(c, edge)) c.turnOffAt = sig.y;
         }
       }
-      if(c.turnOffAt && c.y > c.turnOffAt - 30){
-        // turned onto the cross street — recycle far ahead, off-screen
+      if(c.turnOffAt && c.y > c.turnOffAt - 34){
+        // VISIBLE turn: the vertical car becomes a horizontal one driving off the cross street
+        crossCars.push({ sig: sig.id, xFt: (c.lane+0.5)*LANE_W, dir: c.lane===0 ? -1 : 1,
+          ySlot: c.turnOffAt - CROSS_W*0.35, spd: (15+Math.random()*7)*MPH*(c.lane===0?-1:1),
+          col: c.col, turnRolled: true });
+        // and the vertical body recycles far ahead, off-screen
         c.turnOffAt = null; c.lastTurnCheck = null;
         c.y = player.y + viewNow*0.9 + 250 + Math.random()*450;
         c.lane = Math.floor(Math.random()*LANES); c.laneF = c.lane;
@@ -535,9 +560,15 @@ function updatePlayer(dt){
     if(stoppedTime > 0.5 && !wasStopped){
       wasStopped = true;
       const sig = nextSignal(player.y);
+      // full stop near a stop-sign line = compliance, recorded and NEVER penalized
+      if(sig && sig.stop){
+        const dLine = sig.y - STOPLINE_GAP - player.y;
+        if(dLine > -8 && dLine < 70) sig.playerStopped = true;
+      }
       const nearRunner = events.runner.state==='running' && sig && sig.id===events.runner.sigIdx;
       const nearAmb = events.amb.state==='active';
-      if(nearRunner){ /* stopping for a red-light runner is the RIGHT move — never penalized */ }
+      const atStopSign = sig && sig.stop && (sig.y - player.y) < 300;
+      if(nearRunner || atStopSign){ /* the RIGHT kind of stop — never penalized */ }
       else if(!nearAmb){
         if(sig) sig.approachStopped = true;
         // 15-ft rule: when you DO stop, leave room to see the tires of the car ahead
@@ -584,10 +615,30 @@ function updatePlayer(dt){
     toast('<span class="big">🚧 Cones.</span> That lane was closed — merge early next time, not at the barrels.', 'bad', 3.0, 'conehit');
   }
 
+  // stop-line crossings: the judgment point for creeping, stop signs, and reds
+  for(const s of signals){
+    if(!s.lineChecked && (player.y + TRUCK_LEN/2) > (s.y - STOPLINE_GAP) && player.y < s.y){
+      s.lineChecked = true;
+      if(s.stop){
+        if(s.playerStopped){
+          ssClean++; score += 75; bonus('FULL STOP +75');
+          toast('Complete stop, then go. Stop signs are the stops we WANT.', 'good', 2.4, 'ssgood');
+        } else {
+          ssRolled++; score = Math.max(0, score-120); flashT = 0.4;
+          toast('<span class="big">Rolled the stop sign.</span> Light pacing is for lights — a stop sign means ALL the way stopped.', 'bad', 3.4, 'ssroll');
+        }
+      } else if(lightState(s,simT).c==='r' && player.spd > 0.5 && player.spd < 15){
+        creeps++; score = Math.max(0, score-50);
+        toast('<b>Crept past the stop point.</b> Hold behind the line — even at a crawl, that space isn\'t yours yet.', 'bad', 3.0, 'creep');
+      }
+    }
+  }
+
   // signal crossings
   for(const s of signals){
     if(!s.crossed && player.y > s.y){
       s.crossed = true;
+      if(s.stop) continue;   // judged at the line, not here; no pacing bonus at stop signs
       const st = lightState(s, simT);
       if(st.c==='r'){
         score = Math.max(0, score-120); collisions++; flashT = 0.5;
@@ -692,7 +743,8 @@ function updateEvents(dt){
   if(!r.done){
     const d = rsig.y - player.y;
     // missed the window (arrived on red / band never cleared)? re-arm at the next light
-    if(r.state==='waiting' && player.y > rsig.y + 20 && r.sigIdx < SIGNALS-1) r.sigIdx++;
+    // (stop-sign junctions can't host a runner — skip them)
+    if(r.state==='waiting' && (rsig.stop || player.y > rsig.y + 20) && r.sigIdx < SIGNALS-1) r.sigIdx++;
     if(r.state==='waiting' && d < 380 && d > 60 && lightState(rsig,simT).c==='g'){
       // wait for a clear band so the runner doesn't plow scenery cars
       const bandClear = !cars.some(c => c.y > rsig.y - CROSS_W - 14 && c.y < rsig.y + 8);
@@ -779,6 +831,22 @@ const ROAD_FT = LANES*LANE_W;
 function updateCross(dt){
   for(const s of signals){
     if(Math.abs(s.y - player.y) > 750) continue;
+    if(s.stop){
+      // 4-way stop: occasional cross car creeps through after its own stop
+      s.crossT = (s.crossT===undefined ? 1+Math.random()*3 : s.crossT) - dt;
+      if(s.crossT <= 0){
+        const bandTop = s.y - CROSS_W - 14, bandBot = s.y + 8;
+        const occupied = cars.some(c => c.y > bandTop && c.y < bandBot);
+        if(!occupied){
+          const dir = Math.random()<0.5 ? 1 : -1;
+          crossCars.push({ sig:s.id, xFt: dir>0 ? -55 : ROAD_FT+55, dir,
+            ySlot: s.y - CROSS_W*(0.28 + 0.44*Math.random()),
+            spd: (14+Math.random()*8)*MPH*dir, col: pickCarColor(), turnRolled:false });
+        }
+        s.crossT = 3.5 + Math.random()*4;
+      }
+      continue;
+    }
     const st = lightState(s, simT);
     if(st.c==='r'){
       // player red = cross street green → cars flow through the intersection
@@ -844,7 +912,7 @@ function updateCross(dt){
         if(clear){
           spawnCar(lane, ty, 17*MPH, 27*MPH);
           const nc = cars[cars.length-1];
-          nc.laneF = Math.max(-0.7, Math.min(LANES-0.3, c.xFt/LANE_W - 0.5));
+          nc.laneF = lane===0 ? -0.45 : LANES-1+0.45;   // enters tight from its own edge, on the road
           crossCars.splice(i,1);
           continue;
         }
@@ -868,8 +936,13 @@ function updateCross(dt){
 function updateCoach(){
   const sig = nextSignal(player.y);
   if(!sig) return;
-  const st = lightState(sig, simT);
   const d = sig.y - player.y;
+  if(sig.stop){
+    if(d < 500 && d > 160)
+      toast('🛑 <b>Stop sign ahead — this one\'s a full stop, by design.</b> All the way to zero, then go.', '', 2.8, 'coachSS'+sig.id, 99);
+    return;
+  }
+  const st = lightState(sig, simT);
   if(d < 460 && d > 140){
     if(st.c==='r' && player.gas)
       toast('<b>Red ahead — prepare to go.</b> Let off now, decelerate slow, arrive rolling.', '', 2.6, 'coachR', 9);
@@ -892,8 +965,10 @@ function computeGrades(){
     if(val>=tiers[0]) return ['E',5]; if(val>=tiers[1]) return ['G',4];
     if(val>=tiers[2]) return ['I',3]; if(val>=tiers[3]) return ['A',2]; return ['P',1];
   }
-  const pacing = stops===0?['E',5]:stops===1?['G',4]:stops===2?['I',3]:stops===3?['A',2]:['P',1];
-  const integEff = Math.max(0, integ - closeStops*5);   // tight stops eat into cushion credit
+  // stop-sign compliance folds into the pacing judgment: rolled signs are pacing-in-the-wrong-place
+  const pacingPen = stops + ssRolled;
+  const pacing = pacingPen===0?['E',5]:pacingPen===1?['G',4]:pacingPen===2?['I',3]:pacingPen===3?['A',2]:['P',1];
+  const integEff = Math.max(0, integ - closeStops*5 - creeps*3);   // tight stops + line-creeps eat cushion credit
   const cushion = g(integEff,[92,84,74,60]);
   const smooth = smoothPen===0?['E',5]:smoothPen<=2?['G',4]:smoothPen<=4?['I',3]:smoothPen<=6?['A',2]:['P',1];
   const commPen = flashGos + falseAlerts;
@@ -936,16 +1011,23 @@ function updateHUD(){
   for(let i=0;i<2;i++){
     const el = $('la'+i), dot = el.querySelector('.dot'), d1 = el.querySelector('.d1'), d2 = el.querySelector('.d2');
     if(ahead[i]){
-      const st = lightState(ahead[i], simT);
       const dist = Math.max(0, Math.round(ahead[i].y - player.y));
-      dot.className = 'dot ' + st.c;
-      d1.textContent = dist + ' ft';
-      // the coasting decision moment: easing off NOW would carry you to this light still rolling
       const coastDist = player.spd*player.spd/(2*COAST) + 140;
-      const urgent = i===0 && st.c!=='g' && player.spd > 18 && dist < coastDist;
-      d2.textContent = urgent ? 'LET OFF NOW — arrive rolling'
-        : st.c==='r' ? 'red — prepare to go' : st.c==='y' ? 'yellow — decide early' : 'green — prepare to slow';
-      el.classList.toggle('urgent', urgent);
+      d1.textContent = dist + ' ft';
+      if(ahead[i].stop){
+        dot.className = 'dot stopSign';
+        const urgent = i===0 && player.spd > 18 && dist < coastDist + 80;
+        d2.textContent = urgent ? 'STOP SIGN — full stop, no rolling' : 'stop sign — this one\'s mandatory';
+        el.classList.toggle('urgent', urgent);
+      } else {
+        const st = lightState(ahead[i], simT);
+        dot.className = 'dot ' + st.c;
+        // the coasting decision moment: easing off NOW would carry you to this light still rolling
+        const urgent = i===0 && st.c!=='g' && player.spd > 18 && dist < coastDist;
+        d2.textContent = urgent ? 'LET OFF NOW — arrive rolling'
+          : st.c==='r' ? 'red — prepare to go' : st.c==='y' ? 'yellow — decide early' : 'green — prepare to slow';
+        el.classList.toggle('urgent', urgent);
+      }
       el.classList.remove('done');
     } else { dot.className='dot'; d1.textContent='—'; d2.textContent = i? 'the one after':'next light'; el.classList.remove('urgent'); el.classList.add('done'); }
   }
@@ -1004,18 +1086,27 @@ function draw(){
     // crosswalk stripes
     ctx.fillStyle = 'rgba(232,229,218,.55)';
     for(let x=left+4; x<right-8; x+=14){ ctx.fillRect(x, sy-10, 8, 8); ctx.fillRect(x, sy-crossH+2, 8, 8); }
-    // stop line (15 ft behind crosswalk) — painted in the light's color so state reads at distance
-    const st = lightState(s, simT);
-    const lc = st.c==='r' ? '#ff5545' : st.c==='y' ? '#ffd23f' : '#37c96f';
     const sly = yToScreen(s.y - STOPLINE_GAP);
-    ctx.save();
-    ctx.shadowColor = lc; ctx.shadowBlur = 14;
-    ctx.fillStyle = lc; ctx.fillRect(left+4, sly, roadW-8, 5);
-    ctx.restore();
-
-    // signal heads both sides
-    drawSignal(left-20, sy-crossH/2, st.c);
-    drawSignal(right+20, sy-crossH/2, st.c);
+    if(s.stop){
+      // 4-way stop: bold white line + octagons — reads different from any light on purpose
+      ctx.save();
+      ctx.shadowColor = '#fff'; ctx.shadowBlur = 8;
+      ctx.fillStyle = '#f2f0e8'; ctx.fillRect(left+4, sly, roadW-8, 6);
+      ctx.restore();
+      drawStopSign(left-20, sly-6);
+      drawStopSign(right+20, sly-6);
+    } else {
+      // stop line painted in the light's color so state reads at distance
+      const st = lightState(s, simT);
+      const lc = st.c==='r' ? '#ff5545' : st.c==='y' ? '#ffd23f' : '#37c96f';
+      ctx.save();
+      ctx.shadowColor = lc; ctx.shadowBlur = 14;
+      ctx.fillStyle = lc; ctx.fillRect(left+4, sly, roadW-8, 5);
+      ctx.restore();
+      // signal heads both sides
+      drawSignal(left-20, sy-crossH/2, st.c);
+      drawSignal(right+20, sy-crossH/2, st.c);
+    }
 
   }
 
@@ -1024,8 +1115,8 @@ function draw(){
   if(nxt){
     const nsy = yToScreen(nxt.y - STOPLINE_GAP);
     if(nsy < 150){
-      const st2 = lightState(nxt, simT);
-      const lc2 = st2.c==='r' ? '#ff5545' : st2.c==='y' ? '#ffd23f' : '#37c96f';
+      const st2 = nxt.stop ? {c:'stop'} : lightState(nxt, simT);
+      const lc2 = st2.c==='stop' ? '#CC0100' : st2.c==='r' ? '#ff5545' : st2.c==='y' ? '#ffd23f' : '#37c96f';
       ctx.save();
       const pulse2 = st2.c==='g' ? 0.75 : 0.6 + 0.3*Math.sin(simT*5);
       ctx.globalAlpha = pulse2;
@@ -1088,6 +1179,18 @@ function draw(){
     }
   }
 
+  // driveway stub — permanent scenery so the pull-out reads as a driveway, not a floating car
+  if(pullout){
+    const dwy = yToScreen(pullout.y);
+    if(dwy > -80 && dwy < H+80){
+      const dwH = 22*pxFt;
+      ctx.fillStyle = '#454e56';
+      ctx.fillRect(right, dwy - dwH/2 - CAR_LEN*pxFt/2, laneW()*1.35, dwH);
+      ctx.fillStyle = '#39434b';
+      ctx.fillRect(right, dwy - dwH/2 - CAR_LEN*pxFt/2 - 3, laneW()*1.35, 3);
+      ctx.fillRect(right, dwy + dwH/2 - CAR_LEN*pxFt/2, laneW()*1.35, 3);
+    }
+  }
   // pull-out car nosing off the right shoulder (the telegraph)
   if(pullout && pullout.state==='nosing'){
     const sy2 = yToScreen(pullout.y);
@@ -1140,7 +1243,7 @@ function draw(){
     } else {
       // first at the light: label the stop line so the crosswalk 15-ft rule reads the same way
       const ns = nextSignal(player.y);
-      if(ns && lightState(ns,simT).c!=='g' && ns.y - player.y < 200 && ns.y - player.y > 0){
+      if(ns && (ns.stop || lightState(ns,simT).c!=='g') && ns.y - player.y < 200 && ns.y - player.y > 0){
         const ly = yToScreen(ns.y - STOPLINE_GAP);
         ctx.fillStyle = 'rgba(255,255,255,.9)';
         ctx.font = `700 10px Roboto, sans-serif`; ctx.textAlign='left'; ctx.textBaseline='middle';
@@ -1293,6 +1396,26 @@ function drawAmbulance(cx, cyBottom){
   ctx.fillStyle = blink? '#46A2D5' : '#ff5545';
   ctx.fillRect(x+wid*.57, y+len*.06, wid*.28, len*.08);
 }
+function drawStopSign(x, y){
+  ctx.save();
+  ctx.translate(x, y);
+  ctx.rotate(Math.PI/8);
+  ctx.fillStyle = '#CC0100';
+  ctx.strokeStyle = '#fff'; ctx.lineWidth = 1.6;
+  ctx.beginPath();
+  for(let k=0;k<8;k++){
+    const a = k*Math.PI/4;
+    const px2 = Math.cos(a)*11, py2 = Math.sin(a)*11;
+    k===0 ? ctx.moveTo(px2,py2) : ctx.lineTo(px2,py2);
+  }
+  ctx.closePath(); ctx.fill(); ctx.stroke();
+  ctx.rotate(-Math.PI/8);
+  ctx.fillStyle = '#fff';
+  ctx.font = '700 7px Roboto, sans-serif';
+  ctx.textAlign = 'center'; ctx.textBaseline = 'middle';
+  ctx.fillText('STOP', 0, 0.5);
+  ctx.restore();
+}
 function drawSignal(x, y, c){
   ctx.fillStyle = '#1A2329'; rr(x-7, y-20, 14, 40, 4); ctx.fill();
   const cols = {r:'#ff5545', y:'#ffd23f', g:'#37c96f'};
@@ -1340,16 +1463,20 @@ function frame(ts){
 function finish(){
   finished = true;
   const g = computeGrades();
-  // pace bonus: efficiency pays — but only on top of clean driving, never instead of it
-  const paceBonus = Math.max(0, Math.round((g.avgMph - 14) * 25));
+  // pace bonus: efficiency pays — but ONLY on top of clean driving, never instead of it
+  // (research: time-pressure scoring teaches gap-shooting; gating it on a clean run is the compromise)
+  const cleanRun = (collisions + ssRolled) <= 1;
+  const paceBonus = cleanRun ? Math.max(0, Math.round((g.avgMph - 14) * 25)) : 0;
   score += paceBonus;
   const mm = Math.floor(simT/60), ss = String(Math.round(simT%60)).padStart(2,'0');
+  const lightCount = signals.filter(s=>!s.stop).length;
+  const ssTotal = SIGNALS - lightCount;
   const rows = [
-    ['Light pacing', g.pacing, `${g.pacedCount} of ${SIGNALS} lights paced · ${stops} full stop${stops===1?'':'s'}`],
-    ['Space cushion', g.cushion, `${g.integ}% cushion integrity` + (closeStops? ` · ${closeStops} stop${closeStops===1?'':'s'} tighter than 15 ft` : ' · every stop left 15 ft')],
+    ['Light pacing & stop discipline', g.pacing, `${g.pacedCount} of ${lightCount} lights paced · ${stops} full stop${stops===1?'':'s'} · stop signs ${ssClean}/${ssTotal} honored`],
+    ['Space cushion', g.cushion, `${g.integ}% cushion integrity` + (closeStops? ` · ${closeStops} stop${closeStops===1?'':'s'} tighter than 15 ft` : '') + (creeps? ` · crept the line ×${creeps}` : '') + (!closeStops&&!creeps? ' · clean stop discipline' : '')],
     ['Smooth & safe', g.smooth, `${hardBrakes} hard brake${hardBrakes===1?'':'s'} · ${collisions} incident${collisions===1?'':'s'}`],
     ['Signals & communication', g.comm, (flashGos+falseAlerts)===0 ? 'clean blinker work all route' : `${flashGos} flash-and-go${flashGos===1?'':'s'} · ${falseAlerts} false alert${falseAlerts===1?'':'s'}`],
-    ['Traffic pace', g.pace, `${g.avgMph.toFixed(1)} mph average · route time ${mm}:${ss} · pace bonus +${paceBonus}`],
+    ['Traffic pace', g.pace, `${g.avgMph.toFixed(1)} mph average · route time ${mm}:${ss}` + (cleanRun? ` · pace bonus +${paceBonus}` : ' · pace bonus void (clean runs only)')],
   ];
   $('gradeRows').innerHTML = rows.map(([name,gr,det])=>`
     <div class="gradeRow"><div class="g bebas g${gr[0]}">${gr[0]}</div>
@@ -1375,7 +1502,7 @@ function startRun(){
   bubbleAcc=0; bubbleSamples=0; bubbleNow=100; simT=0;
   stoppedTime=0; wasStopped=false; throttleIntegral=0; msgCooldown={};
   brakeEpisode=false; brakeStartSpd=0; closeStops=0; crossCars=[]; sideDwellT=0;
-  sigDir=0; sigT=0; flashGos=0; falseAlerts=0; coneHitT=-9;
+  sigDir=0; sigT=0; flashGos=0; falseAlerts=0; coneHitT=-9; ssClean=0; ssRolled=0; creeps=0;
   finished=false; paused=false; running=true;
   $('startOverlay').classList.add('hidden');
   $('endOverlay').classList.add('hidden');
@@ -1449,7 +1576,7 @@ window.addEventListener('load', ()=>{
       stalled: (cars.find(c=>c.stalled)||{}).y, pullout: pullout? {y:Math.round(pullout.y), state:pullout.state}:null}),
     ev:()=>({r:events.runner.state, rc:events.runner.collided, a:events.amb.state, ac:events.amb.complied}),
     cross:()=>crossCars.map(c=>({sig:c.sig, x:Math.round(c.xFt), ySlot:Math.round(c.ySlot), dy:Math.round(c.ySlot-player.y)})),
-    signals:()=>signals.map(s=>({y:s.y, paced:s.paced, crossed:s.crossed, st:lightState(s,simT).c})),
+    signals:()=>signals.map(s=>({y:s.y, paced:s.paced, crossed:s.crossed, stop:!!s.stop, st: s.stop?'stop':lightState(s,simT).c})),
     state:()=>({simT,running,paused,finished,score,stops,collisions,hardBrakes,closeStops,crossN:crossCars.length,bubbleNow,y:player.y,spd:player.spd,lane:player.lane,
       carsAhead: cars.filter(c=>c.lane===Math.round(player.laneF) && c.y>player.y && c.y-player.y<350).length}) };
 });
