@@ -173,6 +173,7 @@
         </div>
         <div class="keys" id="keyHelp"><kbd>↑</kbd> gas &nbsp;·&nbsp; <kbd>↓</kbd> brake &nbsp;·&nbsp; <kbd>←</kbd><kbd>→</kbd> tap once = blinker, tap again = change lanes &nbsp;·&nbsp; <kbd>P</kbd> pause</div>
         <button class="cta orange" id="startBtn">Start the route</button>
+        <div id="verStamp" style="margin-top:12px;font-size:10px;color:var(--grey-400);letter-spacing:.06em"></div>
       </div>
     </div>
 
@@ -193,6 +194,7 @@
         <div id="overallGrade" class="bebas gG">G</div>
         <div id="overallWord">Great</div>
         <div id="finalScore">Score: 0</div>
+        <div style="font-size:10.5px;color:var(--grey-400);margin:-8px 0 12px;line-height:1.5">+100 paced light · +150 scan &amp; yield saves · −60 full stop · −80 to −250 incidents</div>
         <div id="gradeRows"></div>
         <div id="doctrineLine"></div>
         <button class="cta orange" id="againBtn">Run it back</button>
@@ -226,13 +228,14 @@ const VIEW_FT = 850;               // max feet of road visible (recycle bounds u
 const VIEW_SLOW = 480;             // view when stopped; camera zooms out with speed toward VIEW_FT
 const LAT = 2.3;                   // lateral visual stretch — roads/vehicles read wider than raw feet
 const PLAYER_SCREEN_FRAC = 0.80;   // player truck sits at 80% down the canvas
-const SIGNALS = 8;
+const SIGNALS = 10;
 const CROSS_W = 64*FT;             // intersection depth
 const STOPLINE_GAP = 15*FT;        // "stop 15 feet behind crosswalks"
 
-// light cycle
-const G_TIME = 9.0, Y_TIME = 3.2, R_TIME = 9.5;
+// light cycle — long greens so riding the wave strings 2-3 greens together
+const G_TIME = 12.5, Y_TIME = 3.2, R_TIME = 9.5;
 const CYCLE = G_TIME + Y_TIME + R_TIME;
+const GAME_VERSION = 'v2.1 · Jul 3';
 
 // ---------- state ----------
 let cv, ctx, W, H, pxFt, DPR;
@@ -255,6 +258,11 @@ let sigDir = 0, sigT = 0;                 // armed blinker: -1 left, 1 right
 let flashGos = 0, falseAlerts = 0;        // communication infractions
 let closure = null, pullout = null;       // course features
 let coneHitT = -9;
+let zones = [];                           // traffic-density zones along the course
+function zoneAt(y){
+  for(const z of zones) if(y >= z.from && y < z.to) return z.d;
+  return 'medium';
+}
 let messageTimer = 0, lastMsgKey = '', msgCooldown = {};
 let flashT = 0;
 
@@ -264,11 +272,11 @@ function buildCourse(){
   // green wave: signals coordinate around a ~30mph wave; "breaker" lights are offset so you
   // arrive on red — those are the deliberate pace-or-queue moments
   const WAVE_SPD = 44;      // ft/s (~30 mph)
-  const STARTUP = 8;        // s — rough time to get rolling from the start line
+  const STARTUP = 2;        // s — you start already rolling with traffic
   let y = 620;
   for(let i=0;i<SIGNALS;i++){
     let phase = (3 - STARTUP - y/WAVE_SPD) % CYCLE; if(phase<0) phase += CYCLE;
-    const breaker = (i>0) && (Math.random() < 0.4);
+    const breaker = (i>0) && (Math.random() < 0.3);
     if(breaker) phase = (phase + G_TIME + 1.5 + Math.random()*3) % CYCLE;
     phase = (phase + (Math.random()*3 - 1.5) + CYCLE) % CYCLE;   // small jitter
     signals.push({
@@ -307,15 +315,30 @@ function buildCourse(){
     pullout = { y: gaps[2].from + CROSS_W + gaps[2].len*0.5, state:'idle', t:0 };
   }
 
-  // seed traffic in PLATOONS — packs with open road between them, the way arterial traffic
-  // actually flows. Pace well and you ride the gaps; race ahead and you live in the packs.
+  // seed traffic in PLATOONS inside density ZONES — busy stretches where the cushion is the
+  // whole game, and open stretches where you're first (or second) to the light
+  zones = [];
+  {
+    let zy = 200;
+    while(zy < distanceGoal){
+      const r3 = Math.random();
+      const d = r3 < 0.32 ? 'sparse' : r3 < 0.72 ? 'medium' : 'dense';
+      const zlen = 900 + Math.random()*1100;
+      zones.push({ from: zy, to: zy + zlen, d });
+      zy += zlen;
+    }
+  }
+  const ZONE = { sparse:{gap:[850,1400], size:[1,2], mult:0.35},
+                 medium:{gap:[420,900],  size:[2,4], mult:0.7},
+                 dense: {gap:[300,620],  size:[3,5], mult:1.0} };
   let ty = 260;
   while(ty < distanceGoal - 400){
-    const size = 2 + Math.floor(Math.random()*4);   // 2-5 cars per platoon
+    const z = ZONE[zoneAt(ty)];
+    const size = z.size[0] + Math.floor(Math.random()*(z.size[1]-z.size[0]+1));
     for(let k=0;k<size;k++){
       spawnCar(Math.floor(Math.random()*LANES), ty + k*(60+Math.random()*90));
     }
-    ty += 420 + Math.random()*560;
+    ty += z.gap[0] + Math.random()*(z.gap[1]-z.gap[0]);
   }
   cullOverlaps();
   // nobody seeds inside the lane closure
@@ -390,6 +413,24 @@ function updateCars(dt){
       const dR = rs.y - STOPLINE_GAP - c.y;
       if(dR > 0 && dR < 340) target = Math.min(target, Math.max(0, (dR-8)*0.30));
     }
+    // some cars turn off at intersections — platoons thin out instead of riding your whole route
+    if(sig){
+      const dSig = sig.y - c.y;
+      if(dSig < 140 && dSig > 0 && c.lastTurnCheck !== sig.id){
+        c.lastTurnCheck = sig.id;
+        if(Math.random() < 0.14){
+          const edge = Math.random()<0.5 ? 0 : LANES-1;
+          if(c.lane===edge || tryMergeCar(c, edge)) c.turnOffAt = sig.y;
+        }
+      }
+      if(c.turnOffAt && c.y > c.turnOffAt - 30){
+        // turned onto the cross street — recycle far ahead, off-screen
+        c.turnOffAt = null; c.lastTurnCheck = null;
+        c.y = player.y + viewNow*0.9 + 250 + Math.random()*450;
+        c.lane = Math.floor(Math.random()*LANES); c.laneF = c.lane;
+        c.des = (38+Math.random()*14)*MPH; c.spd = c.des*0.85; c.col = pickCarColor();
+      }
+    }
     // vertical traffic yields to cross traffic occupying its path (last overlap source)
     for(const cc of crossCars){
       const dAhead = cc.ySlot - c.y;
@@ -426,7 +467,13 @@ function updateCars(dt){
   for(const c of cars){
     if(c.stalled && Math.abs(c.y - player.y) < 700) continue;   // the stalled car stays put while relevant
     let moved = false;
-    if(c.y < player.y - 520){ c.y = player.y + viewNow*0.85 + 80 + Math.random()*380; moved = true; }
+    if(c.y < player.y - 520){
+      c.y = player.y + viewNow*0.85 + 80 + Math.random()*380;
+      // sparse zones stay sparse — thin the respawns there
+      const zm = { sparse:0.35, medium:0.7, dense:1.0 }[zoneAt(c.y)];
+      if(Math.random() > zm) c.y += 550 + Math.random()*400;
+      moved = true;
+    }
     else if(c.y > player.y + VIEW_FT + 620){ c.y = player.y - 460 - Math.random()*120; moved = true; }
     if(moved){
       c.lane = Math.floor(Math.random()*LANES); c.laneF = c.lane;
@@ -705,12 +752,19 @@ function updateEvents(dt){
   const a = events.amb;
   if(!a.done){
     if(a.state==='idle' && player.y > a.triggerY){
-      a.state='active'; a.y = player.y - 300; a.lane = 1;
-      toast('<span class="big">🚑 Ambulance behind you.</span> Pull right and slow down until it passes.', '', 3.2, 'amb');
+      a.state='active'; a.y = player.y - 300; a.lane = 1; a.laneF = 1;
+      toast('<span class="big">🚑 Ambulance behind you.</span> Pull right and slow — or if you\'re stopped in traffic, just hold still.', '', 3.4, 'amb');
     }
     if(a.state==='active'){
       a.y += (72*MPH/1.6)*dt; // ~66 ft/s
-      if(Math.abs(a.y-player.y)<130 && (Math.round(player.laneF)!==LANES-1 || player.spd>28*MPH)) a.complied = false;
+      // it steers AROUND you — never through you
+      if(Math.abs(a.y - player.y) < 280 && a.lane === Math.round(player.laneF)){
+        a.lane = player.lane===0 ? 1 : player.lane===LANES-1 ? LANES-2 : (Math.random()<0.5?0:LANES-1);
+      }
+      a.laneF += (a.lane - a.laneF) * Math.min(1, dt*3);
+      // compliance: stopped/boxed at a light counts as compliant — you had nowhere to go
+      const stopped = player.spd < 12;
+      if(Math.abs(a.y-player.y)<130 && !stopped && (Math.round(player.laneF)!==LANES-1 || player.spd>28*MPH)) a.complied = false;
       if(a.y > player.y + 420){
         a.done=true; a.state='gone';
         if(a.complied){ score+=150; bonus('YIELDED +150'); toast('Right lane, slowed, let it fly by. Textbook.', 'good', 2.6, 'ambgood'); }
@@ -780,14 +834,15 @@ function updateCross(dt){
     // some cross cars turn onto your road instead of passing through
     if(!c.turnRolled && c.xFt > 4 && c.xFt < ROAD_FT-4){
       c.turnRolled = true;
-      if(Math.random() < 0.22){
-        // turn onto the nearest edge lane and GLIDE in (no teleport-rotate)
+      if(Math.random() < 0.3){
+        // turn onto the nearest edge lane and GLIDE in (no teleport-rotate),
+        // exiting the intersection band with momentum carried through the turn
         const lane = c.dir>0 ? 0 : LANES-1;
-        const ty = c.ySlot + 45;
+        const ty = c.ySlot + 12;
         const clear = !cars.some(o => o.lane===lane && Math.abs(o.y - ty) < 45)
           && !(Math.round(player.laneF)===lane && Math.abs(player.y - ty) < 60);
         if(clear){
-          spawnCar(lane, ty, 12*MPH, 26*MPH);
+          spawnCar(lane, ty, 17*MPH, 27*MPH);
           const nc = cars[cars.length-1];
           nc.laneF = Math.max(-0.7, Math.min(LANES-0.3, c.xFt/LANE_W - 0.5));
           crossCars.splice(i,1);
@@ -1056,7 +1111,8 @@ function draw(){
   for(const c of cars){
     const sy = yToScreen(c.y);
     if(sy<-80||sy>H+80) continue;
-    drawCar(laneToX(c.laneF), sy, CAR_LEN*pxFt, CAR_W*pxFt*LAT, c.col, c.braking, c.hazard);
+    drawCar(laneToX(c.laneF), sy, CAR_LEN*pxFt, CAR_W*pxFt*LAT, c.col, c.braking, c.hazard,
+      c.turnOffAt ? (c.lane===0 ? -1 : 1) : 0);
   }
 
   // 15-ft stop guide: appears behind a slow/stopped car you're closing on
@@ -1091,7 +1147,7 @@ function draw(){
   // ambulance
   if(events.amb.state==='active'){
     const sy = yToScreen(events.amb.y);
-    drawAmbulance(laneToX(events.amb.lane), sy);
+    drawAmbulance(laneToX(events.amb.laneF !== undefined ? events.amb.laneF : events.amb.lane), sy);
   }
 
   // player bubble ring
@@ -1121,7 +1177,7 @@ function draw(){
   if(flashT>0){ ctx.fillStyle = `rgba(204,1,0,${Math.min(.35,flashT*.5)})`; ctx.fillRect(0,0,W,H); }
 }
 function rr(x,y,w,h,r){ ctx.beginPath(); ctx.roundRect(x,y,w,h,r); }
-function drawCar(cx, cyBottom, len, wid, col, braking, hazard){
+function drawCar(cx, cyBottom, len, wid, col, braking, hazard, blinkSide){
   const x = cx-wid/2, y = cyBottom-len;
   ctx.fillStyle = 'rgba(0,0,0,.25)'; rr(x+2,y+3,wid,len,5); ctx.fill();
   ctx.fillStyle = col; rr(x,y,wid,len,5); ctx.fill();
@@ -1142,6 +1198,14 @@ function drawCar(cx, cyBottom, len, wid, col, braking, hazard){
     ctx.fillStyle = '#ffb340';
     ctx.fillRect(x-1, y+2, 4, 4);       ctx.fillRect(x+wid-3, y+2, 4, 4);
     ctx.fillRect(x-1, cyBottom-6, 4, 4); ctx.fillRect(x+wid-3, cyBottom-6, 4, 4);
+    ctx.restore();
+  }
+  if(blinkSide && Math.floor(simT*3)%2===0){
+    const bx = blinkSide<0 ? x-1 : x+wid-3;
+    ctx.save();
+    ctx.shadowColor = '#ffb340'; ctx.shadowBlur = 8;
+    ctx.fillStyle = '#ffb340';
+    ctx.fillRect(bx, y+2, 4, 5); ctx.fillRect(bx, cyBottom-7, 4, 5);
     ctx.restore();
   }
 }
@@ -1194,12 +1258,19 @@ function drawCone(x, y){
 function drawCrossCar(cx, cy, col, dir, reckless){
   const len = CAR_LEN*pxFt*1.5, wid = CAR_W*pxFt*1.5;   // horizontal: length along x
   const x = cx-len/2, y = cy-wid/2;
-  if(reckless){   // speed streaks — this one is MOVING
+  if(reckless){   // speed streaks + pulsing red halo — unmissable
     ctx.save(); ctx.globalAlpha = 0.5;
     for(let k=1;k<=3;k++){
       ctx.fillStyle = `rgba(168,60,48,${0.4/k})`;
       rr(x - dir*len*0.45*k, y+wid*.2, len*.5, wid*.6, 3); ctx.fill();
     }
+    ctx.restore();
+    const pulse = 0.5 + 0.5*Math.sin(simT*8);
+    ctx.save();
+    ctx.beginPath(); ctx.arc(cx, cy, len*0.75 + pulse*7, 0, Math.PI*2);
+    ctx.strokeStyle = `rgba(255,60,48,${0.55+0.35*pulse})`; ctx.lineWidth = 3.5; ctx.stroke();
+    ctx.beginPath(); ctx.arc(cx, cy, len*0.75 + pulse*7, 0, Math.PI*2);
+    ctx.fillStyle = 'rgba(255,60,48,0.10)'; ctx.fill();
     ctx.restore();
   }
   ctx.fillStyle='rgba(0,0,0,.25)'; rr(x+2,y+3,len,wid,4); ctx.fill();
@@ -1288,7 +1359,8 @@ function finish(){
 }
 function startRun(){
   buildCourse();
-  Object.assign(player, {y:0, lane:1, laneF:1, spd:0, gas:false, brake:false});
+  // rolling start — you take over at traffic speed, no cold launch
+  Object.assign(player, {y:0, lane:1, laneF:1, spd:36*MPH, gas:false, brake:false});
   score=0; stops=0; hardBrakes=0; collisions=0;
   bubbleAcc=0; bubbleSamples=0; bubbleNow=100; simT=0;
   stoppedTime=0; wasStopped=false; throttleIntegral=0; msgCooldown={};
@@ -1299,7 +1371,7 @@ function startRun(){
   $('endOverlay').classList.add('hidden');
   $('pauseOverlay').classList.add('hidden');
   $('toast').classList.remove('show');
-  toast('Roll out. <b>Eyes up</b> — the strip above shows your next two lights.', '', 3.0, 'go');
+  toast('You\'re rolling with traffic. <b>Eyes up</b> — the strip above shows your next two lights.', '', 3.0, 'go');
 }
 function setPause(p){
   if(!running||finished) return;
@@ -1354,6 +1426,7 @@ function bindInput(){
 // ---------- boot ----------
 window.addEventListener('load', ()=>{
   cv = $('cv'); ctx = cv.getContext('2d');
+  $('verStamp').textContent = GAME_VERSION + ' — if this doesn\'t match what Albert said, hard-refresh (Cmd+Shift+R)';
   resize();
   window.addEventListener('resize', resize);
   bindInput();
