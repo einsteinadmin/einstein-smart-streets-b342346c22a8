@@ -236,7 +236,7 @@ const STOPLINE_GAP = 15*FT;        // "stop 15 feet behind crosswalks"
 // light cycle — long greens so riding the wave strings 2-3 greens together
 const G_TIME = 12.5, Y_TIME = 3.2, R_TIME = 9.5;
 const CYCLE = G_TIME + Y_TIME + R_TIME;
-const GAME_VERSION = 'v3.4 · Jul 3';
+const GAME_VERSION = 'v3.5 · Jul 3';
 
 // ---------- state ----------
 let cv, ctx, W, H, pxFt, DPR;
@@ -377,7 +377,9 @@ function buildCourse(){
 function spawnCar(lane, y, spd, des){
   const base = (38+Math.random()*14)*MPH;
   cars.push({ lane, laneF: lane, y, spd: spd!==undefined? spd : base*0.9, des: des!==undefined? des : base,
-    col: pickCarColor(), stopped:false });
+    col: pickCarColor(), stopped:false,
+    // personality: how close they follow + a slow speed drift — breaks the even-lattice so gaps breathe
+    gapPref: 1.25 + Math.random()*0.95, moodAmp: 0.05 + Math.random()*0.10, moodPh: Math.random()*6.283 });
 }
 function pickCarColor(){
   const c = ['#8fa3b0','#c7cdd2','#5d6f7b','#9db3a4','#b9a68c','#7a8fa6','#d0c9bd','#65727c'];
@@ -421,8 +423,8 @@ function updateCars(dt){
     }
     if(Math.round(player.laneF)===c.lane && player.y>c.y && player.y-c.y<gap){ gap=player.y-c.y; leadSpd=player.spd; }
 
-    // light constraint
-    let target = c.des;
+    // light constraint — desired speed drifts slowly (±5-15%) so neighbors separate over time
+    let target = c.des * (1 + (c.moodAmp||0)*Math.sin(simT/16 + (c.moodPh||0)));
     const sig = nextSignal(c.y);
     if(sig){
       const dStop = sig.y - STOPLINE_GAP - c.y;
@@ -442,6 +444,15 @@ function updateCars(dt){
         if((st.c==='r' || (st.c==='y' && dStop > c.spd*1.2)) && dStop>0 && dStop < 340){
           target = Math.min(target, Math.max(0, (dStop-8)*0.30));
         }
+      }
+    }
+    // blinker courtesy: signal a lane change and trailing cars in that lane ease off to let you in
+    if(sigDir !== 0 && !c.stalled){
+      const tl = player.lane + sigDir;
+      if(c.lane === tl && c.y < player.y + 30 && player.y - c.y < 100){
+        target = Math.min(target, Math.max(player.spd*0.75, player.spd - 8));
+        if(player.y - c.y < 70)
+          toast('<b>They saw your blinker.</b> Signal early and the lane opens — no need to dive in.', 'good', 2.6, 'courtesy', 30);
       }
     }
     // traffic REACTS to the red-light runner — brake lights ripple before he's in your path
@@ -503,7 +514,7 @@ function updateCars(dt){
     // follow leader: keep ~1.7s, release queues snappily
     if(gap < 1e8){
       const nearSS = sig && sig.stop && (sig.y - c.y) < 340 && (sig.y - c.y) > -6;
-      const want = Math.max(nearSS ? 12 : 20, c.spd*1.7);   // stop-sign queues pack tighter + roll up faster
+      const want = Math.max(nearSS ? 12 : 20, c.spd*(c.gapPref||1.7));   // stop-sign queues pack tighter + roll up faster
       if(gap < want) target = Math.min(target, leadSpd - (want-gap)*(nearSS ? 0.5 : 0.3));
     }
     target = Math.max(0, target);
@@ -528,9 +539,15 @@ function updateCars(dt){
     if(moved){
       c.lane = Math.floor(Math.random()*LANES); c.laneF = c.lane;
       c.des=(38+Math.random()*14)*MPH; c.spd=c.des*0.85; c.col=pickCarColor();
+      c.gapPref = 1.25 + Math.random()*0.95; c.moodAmp = 0.05 + Math.random()*0.10; c.moodPh = Math.random()*6.283;
       c.stalled = false; c.hazard = false;
       for(const s of signals){
-        if(s.stop && c.y > s.y - 900 && c.y < s.y + 40){ c.y = s.y + 140 + Math.random()*320; break; }
+        if(s.stop && c.y > s.y - 900 && c.y < s.y + 40){
+          c.y = s.y + 140 + Math.random()*320;
+          // landing zone is absolute — NEVER materialize onto (or near) the player
+          if(Math.abs(c.y - player.y) < 120) c.y = player.y + viewNow*0.85 + 120 + Math.random()*300;
+          break;
+        }
       }
       if(closure && closure.lanes.includes(c.lane) && c.y > closure.yStart-400 && c.y < closure.yEnd+60){ c.lane = closure.openLane!==undefined?closure.openLane:1; c.laneF = c.lane; }
     }
