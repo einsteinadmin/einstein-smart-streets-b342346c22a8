@@ -236,7 +236,7 @@ const STOPLINE_GAP = 15*FT;        // "stop 15 feet behind crosswalks"
 // light cycle — long greens so riding the wave strings 2-3 greens together
 const G_TIME = 12.5, Y_TIME = 3.2, R_TIME = 9.5;
 const CYCLE = G_TIME + Y_TIME + R_TIME;
-const GAME_VERSION = 'v3.1 · Jul 3';
+const GAME_VERSION = 'v3.2 · Jul 3';
 
 // ---------- state ----------
 let cv, ctx, W, H, pxFt, DPR;
@@ -252,6 +252,7 @@ let stoppedTime = 0, wasStopped = false;
 let throttleIntegral = 0, distanceGoal = 0;
 let brakeEpisode = false, brakeStartSpd = 0;
 let closeStops = 0, crossCars = [];
+let tightT = 0, tightCounted = false;   // live 15-ft-while-stopped tracking
 let sideDwellT = 0;   // how long we've been lingering beside someone
 let bubbleWhy = '';   // what's limiting the cushion right now (front/side/rear/boxed)
 // v2: signals, lane closure, stalled car, pull-out
@@ -354,6 +355,17 @@ function buildCourse(){
     ty += z.gap[0] + Math.random()*(z.gap[1]-z.gap[0]);
   }
   cullOverlaps();
+  // stop signs live on quiet streets — at most ONE seeded car per lane on their approach
+  for(const s of signals){
+    if(!s.stop) continue;
+    const kept = {};
+    for(let i=cars.length-1;i>=0;i--){
+      const c = cars[i];
+      if(!c.stalled && c.y > s.y - 700 && c.y < s.y + 60){
+        if(kept[c.lane]) cars.splice(i,1); else kept[c.lane] = true;
+      }
+    }
+  }
   // nobody seeds inside the lane closure
   if(closure){
     for(let i=cars.length-1;i>=0;i--){
@@ -420,7 +432,7 @@ function updateCars(dt){
           target = Math.min(target, Math.max(0, (dStop-6)*0.28));
           if(dStop < 12 && c.spd < 1.5){
             c.ssWait = (c.ssWait||0) + dt;
-            if(c.ssWait > 0.9){ c.ssClearedId = sig.id; c.ssWait = 0; }
+            if(c.ssWait > 0.6){ c.ssClearedId = sig.id; c.ssWait = 0; }
           }
         }
       } else {
@@ -449,7 +461,7 @@ function updateCars(dt){
       const dSig = sig.y - c.y;
       if(dSig < 140 && dSig > 0 && c.lastTurnCheck !== sig.id){
         c.lastTurnCheck = sig.id;
-        if(Math.random() < 0.14){
+        if(Math.random() < (sig.stop ? 0.45 : 0.14)){
           const edge = Math.random()<0.5 ? 0 : LANES-1;
           if(c.lane===edge || tryMergeCar(c, edge)) c.turnOffAt = sig.y;
         }
@@ -515,6 +527,9 @@ function updateCars(dt){
       c.lane = Math.floor(Math.random()*LANES); c.laneF = c.lane;
       c.des=(38+Math.random()*14)*MPH; c.spd=c.des*0.85; c.col=pickCarColor();
       c.stalled = false; c.hazard = false;
+      for(const s of signals){
+        if(s.stop && c.y > s.y - 650 && c.y < s.y + 40 && Math.random() < 0.75){ c.y = s.y + 140 + Math.random()*320; break; }
+      }
       if(closure && closure.lanes.includes(c.lane) && c.y > closure.yStart-400 && c.y < closure.yEnd+60){ c.lane = closure.openLane!==undefined?closure.openLane:1; c.laneF = c.lane; }
     }
   }
@@ -596,7 +611,7 @@ function updatePlayer(dt){
         if(queuedBehind && atLight){
           // forced queue stop at a red — not a pacing failure; only the 15-ft rule applies
           if(bumperGap < 15){
-            closeStops++;
+            closeStops++; tightCounted = true;
             if(flashT<=0) toast('<b>Too tight.</b> Leave 15 feet when stopped — you should see their tires touch the road.', 'bad', 3.2, 'tight');
           }
         } else {
@@ -607,7 +622,7 @@ function updatePlayer(dt){
             closeStops++;
             if(flashT<=0) toast('<b>Crept past the line.</b> Stop 15 feet behind the crosswalk — that\'s what the line is for.', 'bad', 3.2, 'overline');
           } else if(bumperGap < 15){
-            closeStops++;
+            closeStops++; tightCounted = true;
             if(flashT<=0) toast('<b>Too tight.</b> Leave 15 feet when stopped — you should see their tires touch the road.', 'bad', 3.2, 'tight');
           } else if(flashT<=0){
             toast('That was a full stop. Next time: off the gas <b>a block early</b> — time it so you\'re still rolling.', 'bad', 3.2, 'stop');
@@ -745,8 +760,22 @@ function updateBubble(dt){
       }
     }
   }
+  // riding the bumper while stopped — the 15-ft rule is live, not just at the moment you stop
+  let tooTight = false;
+  if(player.spd < 8 && frontGap < 1e8){
+    const bGap = frontGap - (CAR_LEN+TRUCK_LEN)/2;
+    if(bGap < 15){
+      tooTight = true;
+      const sc = Math.max(0.2, 0.2 + Math.max(0,bGap)/15*0.55);   // 0 ft → 20%, 15 ft → 75%
+      if(sc < worst){ worst = sc; bubbleWhy = 'tight at stop'; }
+      toast('<b>Too tight.</b> Leave 15 feet when stopped — you should see their tires touch the road.', 'bad', 2.8, 'tightlive', 6);
+      tightT += dt;
+      if(tightT > 1.0 && !tightCounted){ tightCounted = true; closeStops++; }
+    }
+  }
+  if(!tooTight && player.spd > 15){ tightT = 0; tightCounted = false; }
   bubbleNow = Math.round(worst*100);
-  if(player.spd > 4 || inBox){ bubbleAcc += worst*dt; bubbleSamples += dt; }
+  if(player.spd > 4 || inBox || tooTight){ bubbleAcc += worst*dt; bubbleSamples += dt; }
   if(worst < 0.45 && player.spd>15) toast('Cushion\'s collapsing — <b>surround yourself with space</b>. Ease off or slide over.', 'bad', 2.6, 'bubble', 6);
 
   // collision with front car
@@ -1281,15 +1310,19 @@ function draw(){
       const gy = yToScreen(guide.y - CAR_LEN/2 - 15);
       const bumperY = yToScreen(guide.y - CAR_LEN/2);
       const gx = laneToX(pl);
-      ctx.strokeStyle = 'rgba(255,255,255,.85)'; ctx.lineWidth = 2; ctx.setLineDash([5,4]);
+      // gap from the truck's NOSE — inside 15 ft the whole guide flips red
+      const gapFt = (guide.y - CAR_LEN/2) - (player.y + TRUCK_LEN/2);
+      const viol = gapFt < 15 && player.spd < 12;
+      const col = viol ? 'rgba(255,82,82,.95)' : 'rgba(255,255,255,.85)';
+      ctx.strokeStyle = col; ctx.lineWidth = viol ? 3 : 2; ctx.setLineDash([5,4]);
       ctx.beginPath(); ctx.moveTo(gx - laneW()*0.42, gy); ctx.lineTo(gx + laneW()*0.42, gy); ctx.stroke();
       // connector: this GAP is the 15 feet
       ctx.setLineDash([2,3]); ctx.lineWidth = 1.5;
       ctx.beginPath(); ctx.moveTo(gx + laneW()*0.34, bumperY); ctx.lineTo(gx + laneW()*0.34, gy); ctx.stroke();
       ctx.setLineDash([]);
-      ctx.fillStyle = 'rgba(255,255,255,.9)';
-      ctx.font = `700 10px Roboto, sans-serif`; ctx.textAlign='left'; ctx.textBaseline='middle';
-      ctx.fillText('15 ft', gx + laneW()*0.48, (gy+bumperY)/2);
+      ctx.fillStyle = viol ? 'rgba(255,82,82,.98)' : 'rgba(255,255,255,.9)';
+      ctx.font = `700 ${viol?11:10}px Roboto, sans-serif`; ctx.textAlign='left'; ctx.textBaseline='middle';
+      ctx.fillText(viol ? Math.max(0,Math.round(gapFt)) + ' ft — back off' : '15 ft', gx + laneW()*0.48, (gy+bumperY)/2);
     } else {
       // first at the light: label the stop line so the crosswalk 15-ft rule reads the same way
       const ns = nextSignal(player.y);
@@ -1552,7 +1585,7 @@ function startRun(){
   bubbleAcc=0; bubbleSamples=0; bubbleNow=100; simT=0;
   stoppedTime=0; wasStopped=false; throttleIntegral=0; msgCooldown={};
   brakeEpisode=false; brakeStartSpd=0; closeStops=0; crossCars=[]; sideDwellT=0;
-  sigDir=0; sigT=0; flashGos=0; falseAlerts=0; coneHitT=-9; ssClean=0; ssRolled=0; creeps=0;
+  sigDir=0; sigT=0; flashGos=0; falseAlerts=0; coneHitT=-9; ssClean=0; ssRolled=0; creeps=0; tightT=0; tightCounted=false;
   finished=false; paused=false; running=true;
   $('startOverlay').classList.add('hidden');
   $('endOverlay').classList.add('hidden');
@@ -1621,7 +1654,7 @@ window.addEventListener('load', ()=>{
   draw(); updateHUD();
   requestAnimationFrame(frame);
   // test/debug handle (harmless in production)
-  window.__g = { player, start:startRun, lane:changeLane, tap:signalTap, tick:step,
+  window.__g = { player, cars:()=>cars, start:startRun, lane:changeLane, tap:signalTap, tick:step,
     course:()=>({closure: closure? {lane:closure.lane, yStart:Math.round(closure.yStart), yEnd:Math.round(closure.yEnd)}:null,
       stalled: (cars.find(c=>c.stalled)||{}).y, pullout: pullout? {y:Math.round(pullout.y), state:pullout.state}:null}),
     ev:()=>({r:events.runner.state, rc:events.runner.collided, a:events.amb.state, ac:events.amb.complied}),
